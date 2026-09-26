@@ -1,5 +1,6 @@
 #pragma once
 #include <UHE.h>
+#include <Platform/Vulkan/RenderGraph/VulkanRenderGraphExecutor.h>
 #include <UHE/Renderer/EditorCamera.h>
 #include <UHE/Renderer/Framebuffer.h>
 #include <UHE/Renderer3D/Animator.h>
@@ -21,11 +22,19 @@ public:
 
 private:
     void RespawnTarget(UHE::Entity target);
+    void RecordScenePass(UHE::RHI::VULKAN::RGPassContext& context);
 
     UHE::Ref<UHE::Scene> m_ActiveScene;
     UHE::EditorCamera m_Camera;
     UHE::Ref<UHE::Framebuffer> m_Framebuffer;
     u32 m_ViewportWidth = 0, m_ViewportHeight = 0;
+
+    // ─── RenderGraph migration (M5 step 4): pending entity pickup ───
+    // The entity-ID target is graph-owned; shots consume LAST frame's pixel
+    // at the top of OnUpdate (pipelined readback, rendergraph.md §12.2).
+    i32 m_PendingPickupX = 0;
+    i32 m_PendingPickupY = 0;
+    bool m_HasPendingPickup = false;
 
     UHE::Entity m_GunEntity;
     UHE::Ref<UHE::RD3d::Animator> m_GunAnimator;

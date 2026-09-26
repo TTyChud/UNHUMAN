@@ -106,14 +106,11 @@ void Editor::OnUpdate(UHE::Timestep ts)
 
     cmd.EndRenderPass();
 
-    // Clear and transition swapchain image for ImGui
-    RHI::RenderPassDesc swapchainPass{};
-    swapchainPass.colorAttachmentCount = 0;
-    swapchainPass.renderWidth = Application::Get().GetWindow().GetWidth();
-    swapchainPass.renderHeight = Application::Get().GetWindow().GetHeight();
-
-    cmd.BeginRenderPass(swapchainPass);
-    cmd.EndRenderPass();
+    // The swapchain scope belongs to the frame graph now (§14 step 5): the
+    // ImGui pass declares it Undefined→ColorAttachment→Present and the
+    // executor owns that scope. The legacy empty-swapchain Begin/EndRenderPass
+    // here cleared the frame, fought the graph's Load-based scope, and double-
+    // transitioned the image to Present before the graph pass ran.
 }
 
 void Editor::OnEvent(UHE::Event& e)

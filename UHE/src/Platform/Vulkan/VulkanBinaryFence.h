@@ -5,7 +5,6 @@
 namespace UHE::RHI::VULKAN
 {
 class VulkanContext;
-struct SemaphoneSubmitInfo;
 
 class VulkanBinaryFence
 {
@@ -16,8 +15,7 @@ public:
     void Init(VulkanContext* context, bool signaled = false);
     void Shutdown();
 
-    void SignalOnCpuIn(VulkanContext* context, const SemaphoneSubmitInfo& submitInfo) const;
-    void WaitOnCpuIn(const SemaphoneSubmitInfo& submitInfo) const;
+    void WaitOnCpuIn() const;
     void ResetIn() const;
 
     [[nodiscard]] bool IsSignaled() const;

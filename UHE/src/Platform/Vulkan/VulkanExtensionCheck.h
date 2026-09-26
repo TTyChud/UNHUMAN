@@ -137,6 +137,14 @@ private:
     vk::PhysicalDeviceVulkan11Features m_v11Features;
     vk::PhysicalDeviceVulkan12Features m_v12Features;
     vk::PhysicalDeviceVulkan13Features m_v13Features;
+    // ── What the HARDWARE actually supports (queried, never assumed) ──
+    // "Promoted to core" only means the EXT struct is always available to
+    // query — individual feature bits inside it stay optional. Enabling a
+    // feature the device reports false for fails vkCreateDevice with
+    // FeatureNotPresent (e.g. RADV Renoir: no ASTC-HDR, no hostImageCopy),
+    // so feature-struct enables must gate on these queried bits.
+    vk::PhysicalDeviceVulkan13Features m_supportedV13Features;
+    vk::PhysicalDeviceHostImageCopyFeaturesEXT m_supportedHostImageCopyFeatures;
     vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT m_dynamicStateFeatures;
     vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT m_dynamicState2Features;
     vk::PhysicalDeviceDescriptorBufferFeaturesEXT m_descriptorBufferFeatures;

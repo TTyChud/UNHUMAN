@@ -1,4 +1,5 @@
 #include "VulkanTypes.h"
+#include "UHE/Core/Log.h"
 #include "UHE/RHI/RHITypes.h"
 #include "UHE/Renderer/Shader.h"
 #include "vulkan/vulkan.hpp"

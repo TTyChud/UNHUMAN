@@ -24,7 +24,7 @@ void VulkanBinaryFence::Shutdown()
     m_context = nullptr;
 }
 
-void VulkanBinaryFence::WaitOnCpuIn(const SemaphoneSubmitInfo& submitInfo) const
+void VulkanBinaryFence::WaitOnCpuIn() const
 {
     if (m_context && *m_Fence)
     {

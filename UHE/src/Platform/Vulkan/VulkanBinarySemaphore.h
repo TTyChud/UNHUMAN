@@ -2,10 +2,6 @@
 
 namespace UHE::RHI::VULKAN
 {
-class VulkanSemaphore;
-struct SemaphoneSubmitInfo;
-struct SubmitDesc;
-
 class VulkanContext;
 
 class VulkanBinarySemaphore

@@ -1,6 +1,29 @@
 #include "uhepch.h"
 #include "VulkanDevice.h"
+#include <algorithm>
 #include <GLFW/glfw3.h>
+
+// ─── Frame-loop timeouts (§9.1.5: bounded waits, never UINT64_MAX) ──────────
+// One second of GPU silence on a live submission means the device is gone or a
+// deadlock happened — fail loudly instead of hanging the app.
+static constexpr u64 kFramePacingTimeoutNs = 1'000'000'000ull;
+static constexpr u64 kAcquireTimeoutNs = 1'000'000'000ull;
+
+// Reverse of MapTextureFormat for the formats the swapchain can expose
+// (executor registration carries the engine enum for clear-value typing).
+static UHE::RHI::TextureFormat ToEngineFormat(vk::Format format)
+{
+    using UHE::RHI::TextureFormat;
+    switch (format)
+    {
+        case vk::Format::eB8G8R8A8Unorm: return TextureFormat::BGRA8_UNORM;
+        case vk::Format::eB8G8R8A8Srgb: return TextureFormat::BGRA8_SRGB;
+        case vk::Format::eR8G8B8A8Unorm: return TextureFormat::RGBA8_UNORM;
+        case vk::Format::eR8G8B8A8Srgb: return TextureFormat::RGBA8_SRGB;
+        default: return TextureFormat::RGBA8_UNORM;
+    }
+}
+
 // #include <atomic>
 #include <common/TracyQueue.hpp>
 #include <cstdint>
@@ -11,6 +34,7 @@
 #endif
 #include <vulkan/vulkan_raii.hpp>
 #include <volk.h>
+#include "Platform/Vulkan/UI/VulkanImGuiPass.h"
 #include "Platform/Vulkan/VulkanBuffer.h"
 #include "Platform/Vulkan/VulkanComputePipeline.h"
 #include "Platform/Vulkan/VulkanExtensionCheck.h"
@@ -97,6 +121,20 @@ void VulkanDevice::InitVulkan(const SwapchainDesc& swapDesc)
     m_Context.surface = &m_LogicalDevice.getSurface();
     m_Context.graphicsQueueFamilyIndex = m_LogicalDevice.getGraphicsQueueFamilyIndex();
 
+    // Frame timelines (§9.1.1/D1 v1): one per frame slot, CPU-observable pacing.
+    // On the Legacy tier these degrade to binary semaphores and the timeline
+    // wait becomes a no-op — the in-flight fence stays authoritative there.
+    for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+    {
+        m_FrameTimelines[i].Init(/*requestTimeline=*/true, 0, &m_Context);
+        // Next signal is 1: timeline values must STRICTLY increase (signaling 0
+        // on a 0-valued semaphore is a spec violation — VUID-…-03882 — and
+        // device-losts the submit).
+        m_FrameTimelineValues[i] = 1;
+    }
+    m_BarrierEncoder.Init(&m_Context);
+    m_Jobsystem.Init();
+
     UHE_CORE_INFO("Vulkan sync tier: {}", SyncTierName(m_ExtensionCheck.GetSyncTier()));
 
     g_VulkanContext = &m_Context;
@@ -127,6 +165,10 @@ void VulkanDevice::CleanupVulkan()
     m_UploadFence = nullptr;
     m_UploadCommandPool = nullptr;
     m_RenderFinishedSemaphores.clear();
+    m_BarrierEncoder.Shutdown();
+    for (auto& timeline : m_FrameTimelines)
+        timeline.ShutDown();
+    m_Jobsystem.ShutDown();
 
     m_SwapChain.cleanupSwapChain();
     m_LogicalDevice.cleanup();
@@ -148,6 +190,15 @@ void VulkanDevice::RecreateSwapchain()
     m_SwapChain.cleanupSwapChain();
     m_SwapChain.createSwapChain(m_LogicalDevice.getLogicalDevice(), m_PhysicalDevice.getPhysicalDevice(),
                                 m_LogicalDevice.getSurface(), m_WindowHandle);
+
+    // §9.1.4: registrations bound to the dead swapchain are gone — next
+    // Begin() re-registers the fresh images (which is why resize rebuilds the
+    // graph's cache: imported handles' identity changed).
+    m_RenderGraphExecutor.ClearRegistrations();
+    // The imported swapchain's identity changes with the vk::SwapchainKHR —
+    // bump here (NOT per frame: a stable identity is what lets the §8.3 cache
+    // hit across unchanged frames).
+    ++m_SwapchainGeneration;
 
     m_RenderFinishedSemaphores.clear();
     for (size_t i = 0; i < m_SwapChain.GetImages().size(); i++)
@@ -303,18 +354,35 @@ void VulkanDevice::DeferDestruction(std::function<void()>&& function)
 
 void VulkanDevice::Begin()
 {
+    m_FrameSkipped = false;
+
+    // ── Pacing (§9.1.1): wait for this frame slot's previous use. The timeline
+    // wait is the CPU-observable path on the Sync2 tier and a no-op on Legacy;
+    // the in-flight fence remains the authoritative gate on both (§9.1.1 v1:
+    // delays, never drops). Deletion flush happens only AFTER pacing confirmed
+    // (§9.1.7) — the slot's resources are free to reuse from here on.
+    if (m_FrameTimelineValues[m_CurrentFrame] > 0)
+    {
+        const bool paced = m_FrameTimelines[m_CurrentFrame].WaitCPU(
+            m_FrameTimelineValues[m_CurrentFrame] - 1, kFramePacingTimeoutNs);
+        if (!paced)
+            UHE_CORE_ERROR("VulkanDevice::Begin: frame timeline wait timed out (device lost?)");
+    }
+
     auto waitResult = m_LogicalDevice.getLogicalDevice().waitForFences({*m_Frames[m_CurrentFrame].GetInFlightFence()},
                                                                        VK_TRUE, UINT64_MAX);
 
     m_LogicalDevice.getLogicalDevice().resetFences({*m_Frames[m_CurrentFrame].GetInFlightFence()});
 
+    // ── Acquire ONCE (§9.1.4): no retry loop. Out-of-date → recreate + skip
+    // the frame; the fresh swapchain is acquired on the next Begin.
     vk::Result acquireResult = vk::Result::eSuccess;
     uint32_t imageIndex = 0;
 
     try
     {
         auto [res, idx] = m_SwapChain.GetSwapchain().acquireNextImage(
-            UINT64_MAX, *m_Frames[m_CurrentFrame].GetimageAvailableSemaphore(), nullptr);
+            kAcquireTimeoutNs, *m_Frames[m_CurrentFrame].GetimageAvailableSemaphore(), nullptr);
         acquireResult = res;
         imageIndex = idx;
     }
@@ -326,17 +394,7 @@ void VulkanDevice::Begin()
     if (acquireResult == vk::Result::eErrorOutOfDateKHR)
     {
         RecreateSwapchain();
-        try
-        {
-            auto [res, idx] = m_SwapChain.GetSwapchain().acquireNextImage(
-                UINT64_MAX, *m_Frames[m_CurrentFrame].GetimageAvailableSemaphore(), nullptr);
-            acquireResult = res;
-            imageIndex = idx;
-        }
-        catch (const std::exception&)
-        {
-            throw std::runtime_error("Failed to acquire swap chain image!");
-        }
+        m_FrameSkipped = true; // §9.1.4: recreate + skip, never spin
     }
     else if (acquireResult != vk::Result::eSuccess && acquireResult != vk::Result::eSuboptimalKHR)
     {
@@ -349,26 +407,58 @@ void VulkanDevice::Begin()
 
     m_Frames[m_CurrentFrame].GetDeletionQueue().Flush();
     m_Frames[m_CurrentFrame].GetCommandBuffer().Reset();
-
     m_Frames[m_CurrentFrame].GetCommandBuffer().BeginCommandBuffer(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+
+    if (!m_FrameSkipped)
+        RegisterSwapchainResources(); // live image handles for RGTextureHandle{imageIndex, 1}
 }
 
 void VulkanDevice::End()
 {
+    // §14 step 5: graph passes record into the same primary buffer before it
+    // is ended (single-queue v1 — the TaskGraph overlaps CPU recording with
+    // the previous work, but submit must wait for all nodes). Skipped frames
+    // (§9.1.4) must NOT run the graph: nothing was acquired, the registration
+    // table belongs to a different image index, and recording would either
+    // resolve against stale objects or index the swapchain out of bounds.
+    if (!m_FrameSkipped)
+        EndFrameGraph();
+
     vk::raii::CommandBuffer& cmd = m_Frames[m_CurrentFrame].GetCommandBuffer().GetHandle();
     cmd.end();
 
-    vk::PipelineStageFlags waitResult[] = {vk::PipelineStageFlagBits::eColorAttachmentOutput};
-    vk::SubmitInfo submitInfo{.waitSemaphoreCount = 1,
-                              .pWaitSemaphores = &(*m_Frames[m_CurrentFrame].GetimageAvailableSemaphore()),
-                              .pWaitDstStageMask = waitResult,
-                              .commandBufferCount = 1,
-                              .pCommandBuffers = &(*cmd),
-                              .signalSemaphoreCount = 1,
-                              .pSignalSemaphores = &(*m_RenderFinishedSemaphores[m_ImageIndex])};
+    if (m_FrameSkipped)
+    {
+        // §9.1.4: nothing was acquired — no submit, no present. The (empty or
+        // partial) command buffer is discarded; the frame slot advances.
+        m_FrameSkipped = false;
+        m_CurrentFrame = (m_CurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+        return;
+    }
 
-    vk::raii::Queue& m_graphicsQueue = m_LogicalDevice.getGraphicsQueue();
-    m_graphicsQueue.submit(submitInfo, *m_Frames[m_CurrentFrame].GetInFlightFence());
+    // ── Acquire/present edges (§9.1.3): wait imageAvailable[frame] at
+    // ColorAttachmentOutput; signal renderFinished[image] (binary, per swapchain
+    // image) plus the frame timeline. On the Sync2 tier the timeline signal
+    // carries value+1; on Legacy it degrades to a plain binary signal and the
+    // value is ignored. Tier choice happens inside VulkanSemaphore::Submit.
+    // imageAvailable is a binary semaphore owned by the frame context; the
+    // wait shape is built inline (timeline value ignored, §9.1.3).
+    const SemaphoreWait acquireWait{.Semaphore = *m_Frames[m_CurrentFrame].GetimageAvailableSemaphore(),
+                                    .WaitStage = Stage::ColorOutput,
+                                    .Value = 0};
+    const SemaphoreSignal renderDone =
+        SemaphoreSignal{.Semaphore = *m_RenderFinishedSemaphores[m_ImageIndex], .Value = 0};
+    const SemaphoreSignal framePaced =
+        m_FrameTimelines[m_CurrentFrame].GetSignal(m_FrameTimelineValues[m_CurrentFrame]);
+    const SemaphoreWait waits[] = {acquireWait};
+    const SemaphoreSignal signals[] = {renderDone, framePaced};
+
+    vk::raii::Queue& graphicsQueue = m_LogicalDevice.getGraphicsQueue();
+    VulkanRenderGraphExecutor::Submit(&m_Context, graphicsQueue, *cmd, waits, signals,
+                                      *m_Frames[m_CurrentFrame].GetInFlightFence());
+
+    // The timeline value is consumed: the next signal on this slot is value+1.
+    ++m_FrameTimelineValues[m_CurrentFrame];
 
     vk::PresentInfoKHR presentInfo{.waitSemaphoreCount = 1,
                                    .pWaitSemaphores = &(*m_RenderFinishedSemaphores[m_ImageIndex]),
@@ -379,7 +469,7 @@ void VulkanDevice::End()
 
     try
     {
-        auto presentResult = m_graphicsQueue.presentKHR(presentInfo);
+        auto presentResult = graphicsQueue.presentKHR(presentInfo);
         if (presentResult == vk::Result::eErrorOutOfDateKHR || presentResult == vk::Result::eSuboptimalKHR ||
             m_FramebufferResized)
         {
@@ -398,6 +488,143 @@ void VulkanDevice::End()
 RHICommandBuffer& VulkanDevice::GetCurrentCommandBuffer()
 {
     return m_Frames[m_CurrentFrame].GetCommandBuffer();
+}
+
+void VulkanDevice::BeginImGuiPass(const std::string& name)
+{
+    // §14 step 5: declare the ImGui pass into the per-frame graph. The executor
+    // opens the swapchain scope from this declaration (Load preserves the scene
+    // that drew ahead of us; Clear would erase it), and the compiler owns the
+    // ColorAttachment→Present exit transition (§13.5 item 28 defect is gone).
+    // Migration note: the swapchain import starts at ColorAttachment because
+    // legacy scene rendering still draws ahead of this pass; it flips to
+    // Present-based acquire when scene passes go graph-resident (ROADMAP M5
+    // step 4).
+    const vk::Extent2D extent = m_SwapChain.GetExtent();
+    // Initial state is Undefined — an ACQUIRED swapchain image has undefined
+    // layout (the legacy path also emitted Undefined→ColorAttachment on
+    // acquire). Declaring ColorAttachment here would skip the entry transition
+    // and render into a Present/Undefined-layout image. The compiler turns the
+    // Undefined→ColorAttachment first use and ColorAttachment→Present exit
+    // into this pass's pre/post barriers.
+    RGTextureHandle swap = m_FrameGraph.ImportTexture("Swapchain", m_SwapchainGeneration,
+                                                      extent.width, extent.height, 1,
+                                                      ImageState::Undefined,
+                                                      ImageState::Present);
+    m_SwapchainRGHandle = swap; // executor registration keys on this exact slot
+
+    auto& pass = m_FrameGraph.AddPass(name, RGPassType::Graphics);
+    // The attachment target must also be declared written (§7): Write() first,
+    // then Color() re-binds to the version this pass just produced. Without
+    // the Write(), validation reports UndeclaredAttachment and the whole frame
+    // fails to compile (nothing recorded → the swapchain never returns to
+    // Present → the next acquire blocks forever).
+    pass.Write(swap)
+        .Color({swap, LoadOp::Load, StoreOp::Store, {0, 0, 0, 1}})
+        .Execute([](RGPassContext& context) { VulkanImGuiPass::RecordInContext(context); });
+}
+
+void VulkanDevice::RegisterFrameTexture(RGTextureHandle rgTexture, TextureHandle texture)
+{
+    RegisterFrameTextureImpl(rgTexture, texture);
+}
+
+void VulkanDevice::RegisterFrameTextureImpl(RGTextureHandle rgTexture, TextureHandle texture)
+{
+    if (!rgTexture.IsValid() || texture == nullptr)
+        return;
+    auto* vulkanTexture = reinterpret_cast<VulkanTexture*>(texture);
+    m_RenderGraphExecutor.RegisterTexture(rgTexture, vulkanTexture->GetImage(),
+                                          vulkanTexture->GetImageView().operator*(),
+                                          vulkanTexture->GetDesc().width,
+                                          vulkanTexture->GetDesc().height,
+                                          vulkanTexture->GetDesc().format);
+}
+
+void VulkanDevice::EndFrameGraph()
+{
+    // §14 steps 4–5 + M5 step 4: feature passes were declared during this
+    // frame's layer OnUpdate calls (AimLab's scene pass, ...) and the ImGui
+    // pass was declared by VulkanImGuiLayer::End — both land in m_FrameGraph
+    // BEFORE this runs. Resetting here would silently erase them (the graph
+    // would compile to an ImGui-only frame and the scene would vanish), so
+    // the frame is compiled exactly as declared. Reset happens at the end of
+    // this function (or on an error path).
+    RGCompileResult compiled = m_FrameGraph.Compile();
+    if (!compiled.Ok())
+    {
+        for (const RGValidationError& error : compiled.errors)
+            UHE_CORE_ERROR("FrameGraph: {} ({})", error.message, error.passName);
+        m_FrameGraph.Reset();
+        return;
+    }
+
+    // Registration is per-frame (executor contract); the swapchain image is the
+    // only live resource the graph knows about until feature passes migrate.
+    RegisterSwapchainResources();
+
+    // Registration is per-frame (executor contract); the swapchain image is
+    // bound to the slot the import actually allocated (BeginImGuiPass stored
+    // it in m_SwapchainRGHandle), then feature textures follow.
+    RegisterSwapchainResources();
+
+    std::vector<std::string> resolveErrors;
+    RGResolvedFrame resolved = m_RenderGraphExecutor.Resolve(
+        compiled.frame, m_FrameGraph.GetBuilder().Passes(), resolveErrors);
+    if (!resolveErrors.empty())
+    {
+        for (const std::string& error : resolveErrors)
+            UHE_CORE_ERROR("FrameGraph resolve: {}", error);
+        m_FrameGraph.Reset();
+        return;
+    }
+
+    // ── Recording-order edges (single primary command buffer): graph passes
+    // record into the SAME vk::CommandBuffer the device submits, so the
+    // TaskGraph must never run two passes out of declaration order even when
+    // the resource DAG calls them independent — job completion order would
+    // scramble the buffer (e.g. ImGui recorded before the AimLab scene pass,
+    // which draws into a different framebuffer). Chaining every pass to its
+    // predecessor preserves the compiled order; §8.5 lifts this later by
+    // giving each pass its own command buffer (per-thread pools).
+    RGResolvedFrame& orderable = resolved;
+    for (size_t slot = 1; slot < orderable.passes.size(); ++slot)
+    {
+        const u32 previous = static_cast<u32>(slot) - 1;
+        auto& deps = orderable.passes[slot].dependencies;
+        if (std::find(deps.begin(), deps.end(), previous) == deps.end())
+            deps.push_back(previous);
+    }
+
+    m_PassNodes = m_RenderGraphExecutor.MapToTaskgraph(
+        m_TaskGraph, resolved, m_FrameGraph.GetBuilder().Passes(),
+        m_Frames[m_CurrentFrame].GetCommandBuffer().GetHandle(), m_BarrierEncoder);
+    m_RenderGraphExecutor.ExecuteGraph(m_TaskGraph, m_Jobsystem, m_PassNodes);
+    m_TaskGraph.Reset();
+    m_FrameGraph.Reset();
+}
+
+void VulkanDevice::RegisterSwapchainResources()
+{
+    // §8.5: the device binds the live swapchain images to RG handles each
+    // frame so the executor can resolve graph barriers/attachments. Handles
+    // are RGTextureHandle{imageIndex, generation=1}: stable per image index
+    // for the declaration API, and re-registered (not stale) after every
+    // resize because registration is refreshed every Begin().
+    const u32 imageCount = static_cast<u32>(m_SwapChain.GetImages().size());
+    if (m_ImageIndex >= imageCount)
+        return; // defensive: stale index after a surface loss
+    if (!m_SwapchainRGHandle.IsValid())
+        return; // no import declared this frame — nothing to bind
+    const vk::Image image = m_SwapChain.GetImages()[m_ImageIndex];
+    const TextureFormat swapFormat = ToEngineFormat(m_SwapChain.GetSurfaceFormat().format);
+    // Key on the slot the import actually allocated, NOT the raw image index:
+    // imported resources get sequential registry slots, which only coincide
+    // with imageIndex when it happens to be 0.
+    m_RenderGraphExecutor.RegisterTexture(m_SwapchainRGHandle, image,
+                                          m_SwapChain.GetImageView(m_ImageIndex),
+                                          m_SwapChain.GetExtent().width,
+                                          m_SwapChain.GetExtent().height, swapFormat);
 }
 
 void VulkanDevice::ImmediateSubmit(std::function<void(vk::raii::CommandBuffer& cmd)>&& function)

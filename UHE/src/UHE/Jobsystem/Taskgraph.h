@@ -68,6 +68,9 @@ public:
     // spinning idle.
     void Execute(UheJobsystem& jobSystem);
 
+    // Node access for debug overlays and per-node context reclamation.
+    [[nodiscard]] const TaskNode& GetNode(TaskID id) const { return m_nodes[id]; }
+
     // Clears the graph for the next frame
     void Reset();
 

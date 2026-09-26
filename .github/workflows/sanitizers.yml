@@ -141,6 +141,21 @@ jobs:
             s=$(ps -o stat= -p "$APP_PID" 2>/dev/null)
             [ -n "$s" ] && [ "${s:0:1}" != "Z" ]
           }
+          # Reap the child's exit status once it is gone. `wait` on an
+          # already-exited child returns its code (128+signo on signals:
+          # 139=SIGSEGV, 134=SIGABRT, 137=SIGKILL/OOM). The `||` guard matters:
+          # GitHub runs steps with `bash -e`, where a bare failing `wait`
+          # would kill the script before we print the code.
+          report_exit() {
+            local code=0
+            wait "$APP_PID" 2>/dev/null || code=$?
+            echo "Sandbox exit code: $code"
+            case $code in
+              139) echo "(SIGSEGV: segfault — suspect the device/semaphore init path)" ;;
+              134) echo "(SIGABRT: abort/assert — look for the assert line above)" ;;
+              137) echo "(SIGKILL: likely the OOM-killer under TSan+Lavapipe)" ;;
+            esac
+          }
           cleanup() {
             if [ -n "$APP_PID" ] && is_alive; then
               kill "$APP_PID" 2>/dev/null || true
@@ -170,7 +185,8 @@ jobs:
               echo "(still running)"
               kill "$APP_PID" 2>/dev/null || true
             else
-              echo "(process exited early, exit status unknown - see log above)"
+              echo "(process exited early - see log above)"
+              report_exit
             fi
             exit 1
           fi
@@ -179,6 +195,7 @@ jobs:
           for i in $(seq 1 "$SOAK_SECONDS"); do
             if ! is_alive; then
               echo "Smoke test FAILED: engine died during soak"
+              report_exit
               exit 1
             fi
             sleep 1

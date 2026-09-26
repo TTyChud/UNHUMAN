@@ -56,19 +56,6 @@ enum class ImageState : u8
     Storage,
 };
 
-struct SemaphoreWait
-{
-    vk::Semaphore Semaphore = nullptr;
-    Stage WaitStage = Stage::None;
-    u64 Value = 0;
-};
-
-struct SemaphoreSignal
-{
-    vk::Semaphore Semaphore = nullptr;
-    u64 Value = 0;
-};
-
 vk::ImageLayout ToVkImageLayout(ImageState state);
 vk::PipelineStageFlags2 ToVkPipelineStage2(Stage stage);
 vk::AccessFlags2 ToVkAccess2(Access access);

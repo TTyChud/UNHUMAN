@@ -210,7 +210,11 @@ vk::PhysicalDeviceFeatures2* VulkanExtensionCheck::BuildDeviceFeatureChain()
         m_v13Features.inlineUniformBlock = VK_TRUE;
     if (Supports(Extension::ImageRobustness))
         m_v13Features.robustImageAccess = VK_TRUE;
-    if (Supports(Extension::TextureCompressionASTCHDR))
+    // The extension is core at 1.3, but the FEATURE BIT is optional hardware
+    // capability (RADV Renoir reports false). Gate on the queried bit, not the
+    // extension/API version — requesting an unsupported bit kills
+    // vkCreateDevice with FeatureNotPresent.
+    if (m_supportedV13Features.textureCompressionASTC_HDR)
         m_v13Features.textureCompressionASTC_HDR = VK_TRUE;
 
     // ── Extension Feature Structs (appended to the pNext chain after v13) ──
@@ -310,7 +314,9 @@ vk::PhysicalDeviceFeatures2* VulkanExtensionCheck::BuildDeviceFeatureChain()
         *pNextChainTail = &m_pageableDeviceLocalMemoryFeatures;
         pNextChainTail = &m_pageableDeviceLocalMemoryFeatures.pNext;
     }
-    if (Supports(Extension::HostImageCopy))
+    // Same optional-bit rule as ASTC-HDR: core promotion makes the struct
+    // queryable, the bit itself stays hardware-optional.
+    if (m_supportedHostImageCopyFeatures.hostImageCopy)
     {
         m_hostImageCopyFeatures.hostImageCopy = VK_TRUE;
         *pNextChainTail = &m_hostImageCopyFeatures;
@@ -332,6 +338,17 @@ void VulkanExtensionCheck::QuerySupportedFeatures(const vk::raii::PhysicalDevice
     vk::PhysicalDeviceFeatures2 coreQuery{};
     vkGetPhysicalDeviceFeatures2(*PhysicalDevice, reinterpret_cast<VkPhysicalDeviceFeatures2*>(&coreQuery));
     m_supportedCoreFeatures = coreQuery.features;
+
+    // ── Query the optional feature structs the feature chain wants to enable ──
+    // Promotion folds the STRUCT into core (always queryable), not the BITS
+    // (still optional). Asking vkCreateDevice for a false bit is
+    // VK_ERROR_FEATURE_NOT_PRESENT — the RADV Renoir class of failure — so
+    // BuildDeviceFeatureChain gates on these queried copies.
+    vk::PhysicalDeviceFeatures2 queryChain{};
+    m_supportedV13Features.pNext = &m_supportedHostImageCopyFeatures;
+    m_supportedHostImageCopyFeatures.pNext = nullptr;
+    queryChain.pNext = &m_supportedV13Features;
+    vkGetPhysicalDeviceFeatures2(*PhysicalDevice, reinterpret_cast<VkPhysicalDeviceFeatures2*>(&queryChain));
 
     if (!Supports(Extension::FragmentShadingRate))
         return;

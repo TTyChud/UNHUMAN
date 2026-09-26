@@ -7,6 +7,7 @@
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
 // clang-format on
+#include "Platform/Vulkan/UI/VulkanImGuiPass.h"
 #include "Platform/Vulkan/VulkanCommandBuffer.h"
 #include "Platform/Vulkan/VulkanDevice.h"
 #include "Platform/Vulkan/VulkanLogicalDevice.h"
@@ -88,68 +89,17 @@ void VulkanImGuiLayer::Begin()
 
 void VulkanImGuiLayer::End()
 {
-    ImGui::Render();
-
-    ImDrawData* draw_data = ImGui::GetDrawData();
-
-    auto* rhiCmd = static_cast<VulkanCommandBuffer*>(&m_Device->GetCurrentCommandBuffer());
-    vk::raii::CommandBuffer& cmd = rhiCmd->GetHandle();
-
-    auto& swapchain = m_Device->getSwapChainClass();
-    u32 imageIndex = m_Device->ImageIndex();
-    vk::Image swapchainImage = swapchain.GetImages()[imageIndex];
-    vk::raii::ImageView& swapchainImageView = swapchain.GetImageView(imageIndex);
-    vk::Extent2D extent = swapchain.GetExtent();
-
-    vk::ImageMemoryBarrier barrier{.srcAccessMask = {},
-                                   .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite |
-                                                    vk::AccessFlagBits::eColorAttachmentRead,
-                                   .oldLayout = vk::ImageLayout::eUndefined,
-                                   .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .image = swapchainImage,
-                                   .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-                                                        .baseMipLevel = 0,
-                                                        .levelCount = 1,
-                                                        .baseArrayLayer = 0,
-                                                        .layerCount = 1}};
-
-    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                        vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, nullptr, nullptr, barrier);
-
-    vk::RenderingAttachmentInfo colorAttachment{
-        .imageView = *swapchainImageView,
-        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-        .resolveMode = {},
-        .resolveImageView = {},
-        .resolveImageLayout = {},
-        .loadOp = vk::AttachmentLoadOp::eClear,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-        .clearValue = vk::ClearValue{vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}}}};
-
-    vk::RenderingInfo renderingInfo{.flags = {},
-                                    .renderArea = {.offset = vk::Offset2D{.x = 0, .y = 0}, .extent = extent},
-                                    .layerCount = 1,
-                                    .viewMask = 0,
-                                    .colorAttachmentCount = 1,
-                                    .pColorAttachments = &colorAttachment,
-                                    .pDepthAttachment = nullptr,
-                                    .pStencilAttachment = nullptr};
-
-    cmd.beginRendering(renderingInfo);
-
-    ImGui_ImplVulkan_RenderDrawData(draw_data, *cmd);
-
-    cmd.endRendering();
-
-    barrier.oldLayout = vk::ImageLayout::eColorAttachmentOptimal;
-    barrier.newLayout = vk::ImageLayout::ePresentSrcKHR;
-    barrier.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
-    barrier.dstAccessMask = {};
-
-    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eBottomOfPipe, {},
-                        nullptr, nullptr, barrier);
+    // §14 step 5: host state only. The old body hardcoded Undefined→
+    // ColorAttachment and ColorAttachment→Present barriers plus a Clear-load
+    // swapchain scope — all three belong to the graph now (the compiler emits
+    // the transitions; Load preserves the frame's earlier passes).
+    //
+    // The ImGui pass is declared exactly once per frame — HERE, after the draw
+    // data is ready. (VulkanDevice::EndFrameGraph does NOT declare it: its old
+    // Reset-then-declare ordering wiped feature passes and duplicated this
+    // pass every frame.) EndFrameGraph then compiles whatever the layers
+    // declared, ImGui last — which is exactly the required declaration order.
+    VulkanImGuiPass::EndHostFrame();
 
     ImGuiIO& io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
@@ -157,5 +107,7 @@ void VulkanImGuiLayer::End()
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
     }
+
+    m_Device->BeginImGuiPass("ImGui");
 }
 } // namespace UHE::RHI::VULKAN
