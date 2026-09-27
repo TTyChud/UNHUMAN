@@ -37,6 +37,8 @@ RGUseRequirement TextureWriteRequirement(RGPassType passType, bool isDepth)
 {
     if (isDepth)
         return {ImageState::DepthAttachment, Stage::DepthLate, Access::DepthWrite};
+    if (passType == RGPassType::Transfer)
+        return {ImageState::TransferDst, Stage::Transfer, Access::TransferWrite};
     if (passType == RGPassType::Compute)
         return {ImageState::Storage, Stage::Compute, Access::ShaderWrite};
     return {ImageState::ColorAttachment, Stage::ColorOutput, Access::ColorWrite};

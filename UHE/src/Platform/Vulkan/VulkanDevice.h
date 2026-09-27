@@ -65,6 +65,13 @@ public:
     [[nodiscard]] VulkanRenderGraph& GetFrameGraph() { return m_FrameGraph; }
     [[nodiscard]] bool FrameSkipped() const override { return m_FrameSkipped; }
 
+    // Set by VulkanCommandBuffer::BeginRenderPass when a frame's legacy scene
+    // pass rendered directly into the swapchain (leaving it in the Present
+    // layout). BeginImGuiPass reads it to choose the swapchain import's initial
+    // state; reset every Begin().
+    void MarkSwapchainRenderedByLegacy() { m_LegacySwapchainRendered = true; }
+    [[nodiscard]] bool SwapchainRenderedByLegacy() const { return m_LegacySwapchainRendered; }
+
     // Declares/refreshes the ImGui pass (§14 step 5): executor opens the
     // swapchain scope from this declaration; the compiler owns the layout
     // transitions. Called from VulkanImGuiLayer::End after host-side Render.
@@ -140,8 +147,9 @@ private:
     u32 m_CurrentFrame = 0;
     u32 m_ImageIndex = 0; // Current swapchain image index
     bool m_FramebufferResized = false;
-    bool m_FrameSkipped = false;      // §9.1.4: acquire failed → recreate + skip
-    bool m_FrameGraphFailed = false;  // graph compile/resolve failed → skip submit/present
+    bool m_FrameSkipped = false;            // §9.1.4: acquire failed → recreate + skip
+    bool m_FrameGraphFailed = false;        // graph compile/resolve failed → recovery path
+    bool m_LegacySwapchainRendered = false; // legacy BeginRenderPass wrote the swapchain this frame
 
     // Render graph execution (§8.5/§8.6): resolves RG handles to the live
     // swapchain images each frame and encodes compiler-derived barriers.

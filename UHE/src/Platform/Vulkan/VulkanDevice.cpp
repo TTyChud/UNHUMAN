@@ -366,6 +366,7 @@ void VulkanDevice::Begin()
 {
     m_FrameSkipped = false;
     m_FrameGraphFailed = false;
+    m_LegacySwapchainRendered = false;
     m_RenderGraphExecutor.ClearRegistrations();
 
     // ── Pacing (§9.1.1): wait for this frame slot's previous use. The timeline
@@ -433,6 +434,22 @@ void VulkanDevice::End()
         EndFrameGraph();
 
     vk::raii::CommandBuffer& cmd = m_Frames[m_CurrentFrame].GetCommandBuffer().GetHandle();
+
+    if (m_FrameGraphFailed && !m_LegacySwapchainRendered)
+    {
+        // The graph is what would have transitioned the acquired image to
+        // Present, but it failed before recording anything. Emit that
+        // transition here so the frame can still be submitted and presented —
+        // consuming the acquire semaphore and releasing the image — instead of
+        // being dropped with an acquired-but-unpresented image.
+        TransitionLayout(cmd, m_SwapChain.GetImages()[m_ImageIndex],
+                         vk::ImageLayout::eUndefined, vk::ImageLayout::ePresentSrcKHR,
+                         vk::AccessFlags{}, vk::AccessFlags{},
+                         vk::PipelineStageFlagBits::eTopOfPipe,
+                         vk::PipelineStageFlagBits::eBottomOfPipe);
+    }
+    m_FrameGraphFailed = false;
+
     cmd.end();
 
     if (m_FrameSkipped)
@@ -447,20 +464,9 @@ void VulkanDevice::End()
         return;
     }
 
-    if (m_FrameGraphFailed)
-    {
-        // EndFrameGraph already reset the graph and logged the cause. The
-        // acquired image was never transitioned to Present (the graph emits
-        // that), so submitting/presenting it would be invalid: skip both. The
-        // fence stays signaled for the same reason as the skipped path.
-        m_FrameGraphFailed = false;
-        m_CurrentFrame = (m_CurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
-        return;
-    }
-
-    // Fence reset is deferred to here rather than done in Begin(): a skipped or
-    // graph-failed frame never submits, so leaving the (already-signaled) fence
-    // alone keeps the next Begin()'s wait a no-op.
+    // Fence reset is deferred to here rather than done in Begin(): a skipped
+    // frame never submits, so leaving the (already-signaled) fence alone keeps
+    // the next Begin()'s wait a no-op.
     m_LogicalDevice.getLogicalDevice().resetFences({*m_Frames[m_CurrentFrame].GetInFlightFence()});
 
     // ── Acquire/present edges (§9.1.3): wait imageAvailable[frame] at
@@ -528,15 +534,17 @@ void VulkanDevice::BeginImGuiPass(const std::string& name)
     // Present-based acquire when scene passes go graph-resident (ROADMAP M5
     // step 4).
     const vk::Extent2D extent = m_SwapChain.GetExtent();
-    // Initial state is Undefined — an ACQUIRED swapchain image has undefined
-    // layout (the legacy path also emitted Undefined→ColorAttachment on
-    // acquire). Declaring ColorAttachment here would skip the entry transition
-    // and render into a Present/Undefined-layout image. The compiler turns the
-    // Undefined→ColorAttachment first use and ColorAttachment→Present exit
-    // into this pass's pre/post barriers.
+    // The acquired image starts Undefined UNLESS a legacy scene pass already
+    // rendered into it this frame — BeginRenderPass's swapchain fallback leaves
+    // it in Present (EndRenderPass emits ColorAttachment→Present), so the
+    // import must start there or the compiler's entry barrier would assert the
+    // wrong oldLayout. The compiler then emits the entry transition and the
+    // ColorAttachment→Present exit as this pass's pre/post barriers.
+    const ImageState swapInitialState =
+        m_LegacySwapchainRendered ? ImageState::Present : ImageState::Undefined;
     RGTextureHandle swap = m_FrameGraph.ImportTexture("Swapchain", m_SwapchainGeneration,
                                                       extent.width, extent.height, 1,
-                                                      ImageState::Undefined,
+                                                      swapInitialState,
                                                       ImageState::Present);
     m_SwapchainRGHandle = swap; // executor registration keys on this exact slot
 

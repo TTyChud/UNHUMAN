@@ -11,14 +11,15 @@ namespace UHE::RHI::VULKAN
 // Split of responsibilities:
 //   - Host state (NewFrame/Render/draw data) stays with the layer.
 //   - The DEVICE declares the pass into the frame graph (BeginImGuiPass) with
-//     Load/Store ops and the swapchain import's states — migration note: the
-//     swapchain import starts at ColorAttachment while legacy scene rendering
-//     (not yet graph-resident) draws ahead of this pass; it flips to Present
-//     when scene passes declare against the graph (ROADMAP M5 step 4).
-//   - The COMPILER owns the layout transitions (ColorAttachment → Present exit;
-//     no entry transition needed while the import starts in ColorAttachment).
-//     The hardcoded Undefined→ColorAttachment and ColorAttachment→Present
-//     barriers the legacy End() emitted are gone (§13.5 item 28 defect).
+//     Load/Store ops and the swapchain import's states. The import starts at
+//     Present when legacy scene rendering (not yet graph-resident) already drew
+//     to the swapchain this frame, otherwise at Undefined; it flips to the
+//     graph's own Present acquire once scene passes are graph-resident
+//     (ROADMAP M5 step 4).
+//   - The COMPILER owns the layout transitions (entry → ColorAttachment,
+//     ColorAttachment → Present exit). The hardcoded Undefined→ColorAttachment
+//     and ColorAttachment→Present barriers the legacy End() emitted are gone
+//     (§13.5 item 28 defect).
 //   - The EXECUTOR owns the dynamic-rendering scope (Load preserves the scene).
 //   - This file only records ImGui's draw data inside that scope.
 class VulkanImGuiPass

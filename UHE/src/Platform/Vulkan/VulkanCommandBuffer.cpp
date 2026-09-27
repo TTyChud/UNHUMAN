@@ -78,6 +78,9 @@ void VulkanCommandBuffer::BeginRenderPass(const RenderPassDesc& desc)
         // Swapchain fallback
         auto& device = UHE::Renderer::GetDevice();
         auto& vulkanDevice = static_cast<VulkanDevice&>(device);
+        // EndRenderPass leaves the swapchain in Present; the render graph's
+        // swapchain import must know it was touched so it starts at Present.
+        vulkanDevice.MarkSwapchainRenderedByLegacy();
         auto& swapChain = vulkanDevice.getSwapChainClass();
         u32 index = vulkanDevice.ImageIndex();
         vk::Image image = swapChain.GetImages()[index];
