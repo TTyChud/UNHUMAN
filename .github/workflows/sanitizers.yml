@@ -130,9 +130,9 @@ jobs:
             echo "---------------- Sandbox output (last 200 lines) ----------------"
             tail -n 200 "$LOG" 2>/dev/null || true
             echo "-----------------------------------------------------------------"
-            if grep -qE 'ERROR: (Thread|Address)Sanitizer|SUMMARY: (Thread|Address)Sanitizer' "$LOG" 2>/dev/null; then
+            if grep -qE 'ERROR: (Thread|Address)Sanitizer|SUMMARY: (Thread|Address)Sanitizer|WARNING: ThreadSanitizer|FATAL: ThreadSanitizer|LLVM ERROR' "$LOG" 2>/dev/null; then
               echo "Sanitizer findings (first match):"
-              grep -m1 -E 'ERROR: (Thread|Address)Sanitizer|SUMMARY: (Thread|Address)Sanitizer' "$LOG" || true
+              grep -m1 -E 'ERROR: (Thread|Address)Sanitizer|SUMMARY: (Thread|Address)Sanitizer|WARNING: ThreadSanitizer|FATAL: ThreadSanitizer|LLVM ERROR' "$LOG" || true
             fi
           }
           # True unless the process is gone or a zombie (zombie => already died).
@@ -202,3 +202,36 @@ jobs:
           done
 
           echo "Sandbox rendered frames and survived the soak under ${{ matrix.sanitizer }}. Smoke test passed!"
+
+      # TEMP DEBUG (revert after triage): the thread smoke dies with exit 66
+      # and no sanitizer report in the log. Re-run Sandbox under gdb, catch
+      # the exit_group syscall, and print WHO calls exit (libtsan Die?
+      # engine exit? loader/driver?). Runs only when the smoke step failed.
+      - name: TEMP debug thread-smoke exit (gdb catch syscall)
+        if: failure() && matrix.sanitizer == 'thread'
+        shell: bash
+        run: |
+          command -v gdb >/dev/null || sudo apt-get install -y gdb
+          OUT_DIR="bin/Debug-linux-x64-thread"
+          export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)
+          export TSAN_OPTIONS="second_deadlock_stack=1:suppressions=$PWD/tsan.supp"
+          Xvfb :99 -screen 0 1280x720x24 &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          for i in $(seq 1 50); do
+            [ -S /tmp/.X11-unix/X99 ] && break
+            sleep 0.2
+          done
+          cd "$OUT_DIR"
+          # catch exit_group only (not plain exit: thread teardown would false
+          # positive). gdb prints "[Inferior 1 exited with code ...]" (octal:
+          # 0102 == 66) followed by the backtrace at the exit call.
+          stdbuf -oL -eL timeout 120 gdb --batch \
+            -ex "set confirm off" \
+            -ex "catch syscall exit_group" \
+            -ex run \
+            -ex bt \
+            --args ./Sandbox >gdb.log 2>&1
+          echo "gdb step exit: $?"
+          tail -n 80 gdb.log
+          kill "$XVFB_PID" 2>/dev/null || true
