@@ -8,9 +8,36 @@
 #include <UHE/Renderer3D/LightSystem.h>
 #include <UHE/Renderer3D/Renderer3D.h>
 #include <UHE/Scene/Components.h>
+#include <UHE/RHI/RHIDevice.h>
+#include <Platform/Vulkan/VulkanDevice.h>
+#include <Platform/Vulkan/RenderGraph/VulkanRenderGraph.h>
+#include <Platform/Vulkan/RenderGraph/VulkanRenderGraphExecutor.h>
+#include <Platform/Vulkan/VulkanTexture.h>
 #include <glm/gtx/quaternion.hpp>
 #include <imgui.h>
 #include <random>
+
+// ─── RenderGraph feature-pass migration (docs/architecture/rendergraph.md §14
+// step 5 / ROADMAP M5 step 4): this layer's scene pass declares against the
+// frame graph instead of calling cmd.BeginRenderPass/EndRenderPass (whose
+// legacy path hardcodes Undefined→attachment and attachment→ShaderRead
+// transitions every frame). Sync is the compiler's contract now.
+namespace
+{
+using UHE::RHI::LoadOp;
+using UHE::RHI::StoreOp;
+using UHE::RHI::VULKAN::ImageState;
+using UHE::RHI::VULKAN::RGTextureHandle;
+
+struct AimLabRGHandles
+{
+    RGTextureHandle color{};
+    RGTextureHandle entityTarget{};
+    RGTextureHandle depth{};
+    bool declared = false;
+};
+AimLabRGHandles s_AimLabRG;
+} // namespace
 
 // File-scoped statics for live tweaking the gun model
 static f32 s_GunScale = 0.13f;
@@ -189,6 +216,28 @@ void AimLabLayer::OnUpdate(UHE::Timestep ts)
                                              m_GunEntity.GetComponent<UHE::TransformComponent>().Translation);
     }
 
+    // ─── RenderGraph migration: consume LAST frame's pending pickup ───
+    // Reads the entity-ID target for a shot whose scene pass completed last
+    // frame (graph-owned target; see the shot handler below).
+    if (m_HasPendingPickup)
+    {
+        m_HasPendingPickup = false;
+        const i32 pixelData =
+            m_Framebuffer->ReadPixel(1, m_PendingPickupX, m_PendingPickupY);
+        if (pixelData >= 0)
+        {
+            for (auto& target : m_Targets)
+            {
+                if (static_cast<i32>(static_cast<entt::entity>(target)) == pixelData)
+                {
+                    m_Hits++;
+                    RespawnTarget(target);
+                    break;
+                }
+            }
+        }
+    }
+
     // Only shoot on click (not hold); crosshair is fixed at screen center
     if (mouseDown && !m_MouseWasPressed && m_CursorLocked && !m_IsReloading && m_Ammo > 0)
     {
@@ -210,22 +259,14 @@ void AimLabLayer::OnUpdate(UHE::Timestep ts)
         // Add a kick to the gun's pitch for recoil
         m_RecoilOffset = 6.0f;
 
-        f32 mx = static_cast<f32>(m_ViewportWidth) * 0.5f;
-        f32 my = static_cast<f32>(m_ViewportHeight) * 0.5f;
-        i32 pixelData = m_Framebuffer->ReadPixel(1, static_cast<i32>(mx), static_cast<i32>(my));
-
-        if (pixelData >= 0)
-        {
-            for (auto& target : m_Targets)
-            {
-                if (static_cast<i32>(static_cast<entt::entity>(target)) == pixelData)
-                {
-                    m_Hits++;
-                    RespawnTarget(target);
-                    break;
-                }
-            }
-        }
+        // ─── RenderGraph migration: entity pickup is now FRAME-DELAYED ───
+        // The entity-ID target is graph-owned; the pixel for THIS shot exists
+        // only after this frame's scene pass runs on the GPU. The pending
+        // query is consumed at the top of the NEXT OnUpdate (rendergraph.md
+        // §12.2: readback must be pipelined, not synchronous).
+        m_PendingPickupX = static_cast<i32>(static_cast<f32>(m_ViewportWidth) * 0.5f);
+        m_PendingPickupY = static_cast<i32>(static_cast<f32>(m_ViewportHeight) * 0.5f);
+        m_HasPendingPickup = true;
 
         // Auto-reload when magazine is empty
         if (m_Ammo <= 0)
@@ -294,35 +335,75 @@ void AimLabLayer::OnUpdate(UHE::Timestep ts)
     glm::quat modelFix = glm::quat(
         glm::vec3(glm::radians(s_GunOffsetRot.x), glm::radians(s_GunOffsetRot.y), glm::radians(s_GunOffsetRot.z)));
 
-    gunTransform.Rotation = glm::eulerAngles(camOrientation * recoilRot * modelFix);
-
-    // === Render Pass (same as Editor.cpp) ===
+    gunTransform.Rotation = glm::eulerAngles(camOrientation * recoilRot * modelFix);    // === Scene pass, declared against the frame graph (rendergraph.md §14
+    // step 5 / ROADMAP M5 step 4). Sync comes from the compiler: the
+    // Undefined→attachment transitions happen as pre-barriers from TopOfPipe,
+    // and EndRenderPass's hardcoded →ShaderRead exits are gone (the ImGui
+    // pass declares its reads instead). ===
     auto& device = UHE::Renderer::GetDevice();
+    auto* vulkanDevice = dynamic_cast<UHE::RHI::VULKAN::VulkanDevice*>(&device);
+    if (vulkanDevice == nullptr)
+        return; // no Vulkan device — nothing to declare against
 
-    UHE::RHI::RenderPassDesc passDesc{};
-    passDesc.renderWidth = m_Framebuffer->GetSpecification().Width;
-    passDesc.renderHeight = m_Framebuffer->GetSpecification().Height;
+    auto& executor = vulkanDevice->GetRenderGraphExecutor();
+    auto& graph = vulkanDevice->GetFrameGraph();
 
-    UHE::RHI::ColorAttachment colorAttachment{};
-    colorAttachment.texture = m_Framebuffer->GetColorAttachments()[0];
-    colorAttachment.clearColor = {0.1f, 0.1f, 0.15f, 1.0f};
-    passDesc.colorAttachments[0] = colorAttachment;
+    const u32 fbWidth = m_Framebuffer->GetSpecification().Width;
+    const u32 fbHeight = m_Framebuffer->GetSpecification().Height;
 
-    UHE::RHI::ColorAttachment entityAttachment{};
-    entityAttachment.texture = m_Framebuffer->GetColorAttachments()[1];
-    entityAttachment.clearColor = {-1.0f, -1.0f, -1.0f, -1.0f};
-    passDesc.colorAttachments[1] = entityAttachment;
-    passDesc.colorAttachmentCount = 2;
+    // ── Resources: persistent RG handles for the framebuffer attachments.
+    // Re-imported every frame (imported slots are identity-keyed by name, so
+    // the handles stay stable across Reset() cycles).
+    s_AimLabRG.declared = true;
+    s_AimLabRG.color = graph.ImportTexture("AimLab.Color", 1, fbWidth, fbHeight, 1,
+                                           ImageState::Undefined, ImageState::ShaderRead);
+    s_AimLabRG.entityTarget = graph.ImportTexture("AimLab.Entity", 1, fbWidth, fbHeight, 1,
+                                                  ImageState::Undefined, ImageState::ShaderRead);
+    s_AimLabRG.depth = graph.ImportTexture("AimLab.Depth", 1, fbWidth, fbHeight, 1,
+                                           ImageState::Undefined, ImageState::Undefined);
 
-    passDesc.hasDepth = true;
-    passDesc.depthAttachment.texture = m_Framebuffer->GetDepthAttachment();
+    // ── Pass declaration: Write + attachments (§7), then defer recording.
+    auto& scenePass =
+        graph.AddPass("AimLab.Scene", UHE::RHI::VULKAN::RGPassType::Graphics);
+    scenePass
+        .Write(s_AimLabRG.color)
+        .Write(s_AimLabRG.entityTarget)
+        .Write(s_AimLabRG.depth)
+        .Color({s_AimLabRG.color, LoadOp::Clear, StoreOp::Store, {0.1f, 0.1f, 0.15f, 1.0f}})
+        .Color({s_AimLabRG.entityTarget, LoadOp::Clear, StoreOp::Store, {-1.0f, -1.0f, -1.0f, -1.0f}})
+        .Depth({s_AimLabRG.depth, LoadOp::Clear, StoreOp::Store, 1.0f, 0})
+        .Execute([this](UHE::RHI::VULKAN::RGPassContext& context)
+        {
+            RecordScenePass(context);
+        });
 
-    auto& cmd = device.GetCurrentCommandBuffer();
-    cmd.BeginRenderPass(passDesc);
-    cmd.SetViewport(0.0f, 0.0f, static_cast<f32>(passDesc.renderWidth), static_cast<f32>(passDesc.renderHeight));
-    cmd.SetScissor(0, 0, passDesc.renderWidth, passDesc.renderHeight);
+    // ── Live Vulkan objects registered so the executor can resolve barriers
+    // and attachments (image/view/format from the live texture; the entity
+    // target's R32_SINT format drives its int-typed clear value).
+    vulkanDevice->RegisterFrameTexture(s_AimLabRG.color, m_Framebuffer->GetColorAttachments()[0]);
+    vulkanDevice->RegisterFrameTexture(s_AimLabRG.entityTarget,
+                                       m_Framebuffer->GetColorAttachments()[1]);
+    vulkanDevice->RegisterFrameTexture(s_AimLabRG.depth, m_Framebuffer->GetDepthAttachment());
 
-    // Render scene manually (no grid)
+    // Viewport/scissor are recorded inside the pass callback (they are pass
+    // state, not graph state).
+}
+
+void AimLabLayer::RecordScenePass(UHE::RHI::VULKAN::RGPassContext& context)
+{
+    // Runs inside the executor-opened scope: transitions/scope are the
+    // compiler's/executor's, this records draws only (§8.4 contract).
+    const vk::CommandBuffer cmd = context.Cmd();
+
+    const vk::Extent2D extent{m_Framebuffer->GetSpecification().Width,
+                              m_Framebuffer->GetSpecification().Height};
+    const vk::Viewport viewport{0.0f, 0.0f, static_cast<f32>(extent.width),
+                                static_cast<f32>(extent.height), 0.0f, 1.0f};
+    cmd.setViewport(0, viewport, context.Dispatcher());
+    cmd.setScissor(0, vk::Rect2D{vk::Offset2D{0, 0}, extent}, context.Dispatcher());
+
+    // Render scene (same draw stream as before; Renderer3D now records into
+    // the pass's command buffer through the RHI facade).
     auto lights = UHE::RD3d::LightSystem::ExtractLights(m_ActiveScene->GetRegistry());
     UHE::Renderer3D::BeginScene(m_Camera, lights);
 
@@ -336,13 +417,11 @@ void AimLabLayer::OnUpdate(UHE::Timestep ts)
             const UHE::RD3d::Animator* animator = nullptr;
             if (entity == static_cast<entt::entity>(m_GunEntity) && m_GunAnimator)
                 animator = m_GunAnimator.get();
-            UHE::Renderer3D::SubmitModel(*model.ModelData, transform.GetTransform(), static_cast<i32>(entity),
-                                         animator);
+            UHE::Renderer3D::SubmitModel(*model.ModelData, transform.GetTransform(),
+                                         static_cast<i32>(entity), animator);
         }
     }
-
     UHE::Renderer3D::EndScene();
-    cmd.EndRenderPass();
 }
 
 void AimLabLayer::RespawnTarget(UHE::Entity target)

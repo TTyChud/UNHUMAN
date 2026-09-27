@@ -165,10 +165,6 @@ void WindowsWindow::OnUpdate() {
 }
 
 void WindowsWindow::SetVSync(bool enabled) {
-  if (enabled)
-    glfwSwapInterval(1);
-  else
-    glfwSwapInterval(0);
   m_Data.VSync = enabled;
 }
 

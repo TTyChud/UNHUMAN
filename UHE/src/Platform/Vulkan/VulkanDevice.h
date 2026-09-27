@@ -1,6 +1,9 @@
 #pragma once
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan_raii.hpp>
+#include "Platform/Vulkan/RenderGraph/VulkanRenderGraphExecutor.h"
+#include "Platform/Vulkan/RenderGraph/VulkanRenderGraph.h"
+#include "Platform/Vulkan/VulkanBarrierEncoder.h"
 #include "Platform/Vulkan/VulkanContext.h"
 #include "Platform/Vulkan/VulkanDescriptorManager.h"
 #include "Platform/Vulkan/VulkanExtensionCheck.h"
@@ -8,14 +11,16 @@
 #include "Platform/Vulkan/VulkanInstance.h"
 #include "Platform/Vulkan/VulkanLogicalDevice.h"
 #include "Platform/Vulkan/VulkanPhysicalDevice.h"
+#include "Platform/Vulkan/VulkanPipelineState.h"
 #include "Platform/Vulkan/VulkanSwapChain.h"
+#include "UHE/Core/Core.h"
 #include "UHE/RHI/RHIDevice.h"
 
 namespace UHE::RHI::VULKAN
 {
 
 class VulkanBuffer;
-class VulkanDevice final : public RHIDevice
+class UHE_API VulkanDevice final : public RHIDevice
 {
 public:
     VulkanDevice(const SwapchainDesc& swapDesc);
@@ -34,6 +39,7 @@ public:
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     ShaderHandle CreateShader(const ShaderDesc& desc) override;
     PipelineHandle CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) override;
+    PipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
 
     void ReadPixel(TextureHandle handle, int x, int y, void* outData) override;
 
@@ -41,11 +47,50 @@ public:
     void DestroyTexture(TextureHandle handle) override;
     void DestroyShader(ShaderHandle handle) override;
     void DestroyGraphicsPipeline(PipelineHandle handle) override;
+    void DestroyComputePipeline(PipelineHandle handle) override;
     void DeferDestruction(std::function<void()>&& function);
     u32 RegisterBuffer(VulkanBuffer* buffer);
 
     // ─── Command Buffer Access ──────────────────────────────────
     RHICommandBuffer& GetCurrentCommandBuffer() override;
+
+    // ─── Render graph (§14 steps 4–5) ──────────────────────────
+    // Executor resolves/records graph passes into the frame's primary command
+    // buffer. Swapchain images are registered under RGTextureHandle{imageIndex,1}
+    // every Begin(); transient graph resources are registered by their owner
+    // right after creation. See rendergraph.md §8.5/§8.6.
+    [[nodiscard]] VulkanRenderGraphExecutor& GetRenderGraphExecutor() { return m_RenderGraphExecutor; }
+    // Per-frame graph feature passes declare into (M5 step 4); Reset() by
+    // EndFrameGraph() after recording.
+    [[nodiscard]] VulkanRenderGraph& GetFrameGraph() { return m_FrameGraph; }
+    [[nodiscard]] bool FrameSkipped() const override { return m_FrameSkipped; }
+
+    // Set by VulkanCommandBuffer::BeginRenderPass when a frame's legacy scene
+    // pass rendered directly into the swapchain (leaving it in the Present
+    // layout). BeginImGuiPass reads it to choose the swapchain import's initial
+    // state; reset every Begin().
+    void MarkSwapchainRenderedByLegacy() { m_LegacySwapchainRendered = true; }
+    [[nodiscard]] bool SwapchainRenderedByLegacy() const { return m_LegacySwapchainRendered; }
+
+    // Declares/refreshes the ImGui pass (§14 step 5): executor opens the
+    // swapchain scope from this declaration; the compiler owns the layout
+    // transitions. Called from VulkanImGuiLayer::End after host-side Render.
+    void BeginImGuiPass(const std::string& name);
+
+    // RG handle of the swapchain import for the frame in progress. Stored by
+    // BeginImGuiPass so RegisterSwapchainResources() binds the live image to
+    // the exact slot the graph declared (imports are slot-sequential, the raw
+    // image index is not).
+
+    // ─── Feature-pass migration (M5 step 4) ────────────────────
+    // Binds an engine texture to an RG handle for the frame (image + view +
+    // format from the live object). Owners call this once per frame per
+    // resource right after creating their RG declarations.
+    void RegisterFrameTexture(RGTextureHandle rgTexture, TextureHandle texture);
+
+    // Declares → compiles → resolves → TaskGraph-maps → records the frame's
+    // graph passes onto the frame's primary command buffer (§14 step 5).
+    void EndFrameGraph();
 
     // ─── Window Management ────────────────────────────────────────
     [[nodiscard]] GLFWwindow* GetWindowHandle() const { return m_WindowHandle; }
@@ -69,6 +114,8 @@ private:
     void InitVulkan(const SwapchainDesc& swapDesc);
     void CleanupVulkan();
     void RecreateSwapchain();
+    void RegisterSwapchainResources();
+    void RegisterFrameTextureImpl(RGTextureHandle rgTexture, TextureHandle texture);
 
     // ─── Immediate Submission (Uploads) ───────────────────────────
 
@@ -83,6 +130,7 @@ private:
     VmaAllocator m_Allocator = nullptr;
     VulkanDescriptorManager m_DescriptorManager;
     VulkanExtensionCheck m_ExtensionCheck;
+    VulkanPipelineStateCache m_PipelineStateCache;
 
     GLFWwindow* m_WindowHandle = nullptr;
     u32 m_WindowWidth;
@@ -91,10 +139,36 @@ private:
     // Frame-in-flight sync
     static constexpr u32 MAX_FRAMES_IN_FLIGHT = 2;
     std::array<VulkanFrameContext, MAX_FRAMES_IN_FLIGHT> m_Frames;
-    std::vector<vk::raii::Semaphore> m_RenderFinishedSemaphores;
+    std::vector<vk::raii::Semaphore> m_RenderFinishedSemaphores; // binary, per swapchain image (§9.1.3)
+    // Frame timeline per frame slot (§9.1.1/D1 v1): CPU pacing before touching
+    // slot-indexed resources. Inert on the Legacy tier (binary + fence pacing).
+    std::array<VulkanSemaphore, MAX_FRAMES_IN_FLIGHT> m_FrameTimelines;
+    std::array<u64, MAX_FRAMES_IN_FLIGHT> m_FrameTimelineValues{}; // next value to signal
     u32 m_CurrentFrame = 0;
     u32 m_ImageIndex = 0; // Current swapchain image index
     bool m_FramebufferResized = false;
+    bool m_FrameSkipped = false;            // §9.1.4: acquire failed → recreate + skip
+    bool m_FrameGraphFailed = false;        // graph compile/resolve failed → recovery path
+    bool m_LegacySwapchainRendered = false; // legacy BeginRenderPass wrote the swapchain this frame
+
+    // Render graph execution (§8.5/§8.6): resolves RG handles to the live
+    // swapchain images each frame and encodes compiler-derived barriers.
+    VulkanRenderGraphExecutor m_RenderGraphExecutor;
+    VulkanBarrierEncoder m_BarrierEncoder;
+
+    // Frame graph + TaskGraph mapping (§14 step 5): per-frame declare →
+    // resolve → record; TaskGraph topology refreshed every EndFrameGraph().
+    VulkanRenderGraph m_FrameGraph;
+    Jobsystem::UheJobsystem m_Jobsystem;
+    Jobsystem::TaskGraph m_TaskGraph;
+    std::vector<Jobsystem::TaskID> m_PassNodes;
+    // §9.1.4: imported swapchain identity — bumped per re-import so a resize
+    // (new vk::SwapchainKHR) changes the topology hash and rebuilds the cache.
+    u64 m_SwapchainGeneration = 0;
+    // The RG slot the swapchain import actually occupies this frame (BeginImGuiPass
+    // stores it). Registration must key on THIS handle — the raw image index is
+    // not the RG slot index (imports allocate sequentially from 0).
+    RGTextureHandle m_SwapchainRGHandle{};
 
     // Immediate submit context
     vk::raii::Fence m_UploadFence = nullptr;

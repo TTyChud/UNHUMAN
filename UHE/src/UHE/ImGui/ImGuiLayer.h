@@ -7,27 +7,28 @@
 
 namespace UHE
 {
-	class UHE_API ImGuiLayer :public Layer {
-	public:
-		ImGuiLayer();
-		~ImGuiLayer();
+class UHE_API ImGuiLayer : public Layer
+{
+public:
+    ImGuiLayer();
+    ~ImGuiLayer() override;
 
-		virtual void OnDetach() override;
-		virtual void OnAttach() override;
-//		virtual void OnImGuiRender() ;
-		virtual void OnEvent(Event& e) override;
+    void OnDetach() override;
+    void OnAttach() override;
+    //		virtual void OnImGuiRender() ;
+    void OnEvent(Event& e) override;
 
-		virtual void Begin() = 0;
-		virtual void End() = 0;
+    virtual void Begin() = 0;
+    virtual void End() = 0;
 
-		static ImGuiLayer* Create();
+    static ImGuiLayer* Create();
 
-		void SetBlockEvent(bool block) { m_BlockEvents = block; }
-	
-		void SetDarkThemeColor();
-	private:
-        float m_Time = 0.0f;
-		bool m_BlockEvents = true;
-		
-	};
-}
+    void SetBlockEvent(bool block) { m_BlockEvents = block; }
+
+    void SetDarkThemeColor();
+
+private:
+    float m_Time = 0.0f;
+    bool m_BlockEvents = true;
+};
+} // namespace UHE

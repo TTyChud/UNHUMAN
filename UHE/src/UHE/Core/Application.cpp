@@ -126,9 +126,15 @@ namespace UHE{
 				Audio::AudioEngine::Update();
 				
 				Renderer::GetDevice().Begin();
+				// §9.1.4 resize policy: Begin may recreate the swapchain and skip
+				// the frame — layers must not record GPU work this iteration.
+				const bool frameSkipped = Renderer::GetDevice().FrameSkipped();
 
-				for (Layer* layer : m_LayerStack)
-					layer->OnUpdate(timestep);
+				if (!frameSkipped)
+				{
+					for (Layer* layer : m_LayerStack)
+						layer->OnUpdate(timestep);
+				}
 
 				m_ImGuiLayer->Begin();
 				for (Layer* layer : m_LayerStack)
