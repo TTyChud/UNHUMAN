@@ -29,11 +29,6 @@ option(VG_PROFILE "Enable Tracy profiling" ON)
 # See tests/CMakeLists.txt; CI rollout in docs/architecture/ci-cd.md §"Test infrastructure".
 option(UHE_TESTS "Build UHE unit tests and register them with CTest" ON)
 
-if(UHE_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif()
-
 # ---------------------------------------------------------------------------
 # Sanitizer support (GCC / Clang) - one flag to pick them all:
 #
@@ -199,6 +194,13 @@ foreach(CONFIG ${CMAKE_CONFIGURATION_TYPES})
   set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${CONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${CONFIG}-${SYS_NAME}-${ARCH}${UHE_SANITIZER_TAG})
   set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${CONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${CONFIG}-${SYS_NAME}-${ARCH}${UHE_SANITIZER_TAG})
 endforeach()
+
+# Tests are added AFTER the sanitizer flags and CMAKE_*_OUTPUT_DIRECTORY setup
+# above so test targets inherit sanitizer instrumentation and the output layout.
+if(UHE_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 
 function(auto_group target)
