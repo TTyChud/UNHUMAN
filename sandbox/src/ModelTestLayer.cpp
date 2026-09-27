@@ -52,12 +52,14 @@ void ModelTestLayer::OnUpdate(UHE::Timestep ts)
     // fails the CI wait. CI greps stdout for this line instead of a fixed
     // wall-clock timeout.
     static bool s_SeenFirstFrame = false;
+    static bool s_ReadyLogged = false;
     if (!s_SeenFirstFrame)
     {
         s_SeenFirstFrame = true;
     }
-    else
+    else if (!s_ReadyLogged)
     {
+        s_ReadyLogged = true;
         UHE_CORE_INFO("[SMOKE-READY] first frame rendered");
     }
 

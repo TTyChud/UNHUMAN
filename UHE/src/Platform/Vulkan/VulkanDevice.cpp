@@ -355,6 +355,7 @@ void VulkanDevice::DeferDestruction(std::function<void()>&& function)
 void VulkanDevice::Begin()
 {
     m_FrameSkipped = false;
+    m_RenderGraphExecutor.ClearRegistrations();
 
     // ── Pacing (§9.1.1): wait for this frame slot's previous use. The timeline
     // wait is the CPU-observable path on the Sync2 tier and a no-op on Legacy;
@@ -371,8 +372,7 @@ void VulkanDevice::Begin()
 
     auto waitResult = m_LogicalDevice.getLogicalDevice().waitForFences({*m_Frames[m_CurrentFrame].GetInFlightFence()},
                                                                        VK_TRUE, UINT64_MAX);
-
-    m_LogicalDevice.getLogicalDevice().resetFences({*m_Frames[m_CurrentFrame].GetInFlightFence()});
+    UHE_CORE_ASSERT(waitResult == vk::Result::eSuccess, "Failed to wait for in-flight fence!");
 
     // ── Acquire ONCE (§9.1.4): no retry loop. Out-of-date → recreate + skip
     // the frame; the fresh swapchain is acquired on the next Begin.
@@ -401,6 +401,9 @@ void VulkanDevice::Begin()
         throw std::runtime_error("Failed to acquire swap chain image!");
     }
 
+    if (!m_FrameSkipped)
+        m_LogicalDevice.getLogicalDevice().resetFences({*m_Frames[m_CurrentFrame].GetInFlightFence()});
+
     m_ImageIndex = imageIndex;
     m_Context.currentFrameIndex = m_CurrentFrame;
     m_Context.imageIndex = m_ImageIndex;
@@ -408,9 +411,6 @@ void VulkanDevice::Begin()
     m_Frames[m_CurrentFrame].GetDeletionQueue().Flush();
     m_Frames[m_CurrentFrame].GetCommandBuffer().Reset();
     m_Frames[m_CurrentFrame].GetCommandBuffer().BeginCommandBuffer(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-
-    if (!m_FrameSkipped)
-        RegisterSwapchainResources(); // live image handles for RGTextureHandle{imageIndex, 1}
 }
 
 void VulkanDevice::End()
@@ -431,6 +431,7 @@ void VulkanDevice::End()
     {
         // §9.1.4: nothing was acquired — no submit, no present. The (empty or
         // partial) command buffer is discarded; the frame slot advances.
+        m_FrameGraph.Reset();
         m_FrameSkipped = false;
         m_CurrentFrame = (m_CurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         return;
@@ -543,6 +544,12 @@ void VulkanDevice::RegisterFrameTextureImpl(RGTextureHandle rgTexture, TextureHa
 
 void VulkanDevice::EndFrameGraph()
 {
+    if (!m_ExtensionCheck.SupportsDynamicRendering())
+    {
+        UHE_CORE_ERROR("EndFrameGraph: dynamic rendering is not supported on this device; skipping frame graph");
+        m_FrameGraph.Reset();
+        return;
+    }
     // §14 steps 4–5 + M5 step 4: feature passes were declared during this
     // frame's layer OnUpdate calls (AimLab's scene pass, ...) and the ImGui
     // pass was declared by VulkanImGuiLayer::End — both land in m_FrameGraph
@@ -558,10 +565,6 @@ void VulkanDevice::EndFrameGraph()
         m_FrameGraph.Reset();
         return;
     }
-
-    // Registration is per-frame (executor contract); the swapchain image is the
-    // only live resource the graph knows about until feature passes migrate.
-    RegisterSwapchainResources();
 
     // Registration is per-frame (executor contract); the swapchain image is
     // bound to the slot the import actually allocated (BeginImGuiPass stored

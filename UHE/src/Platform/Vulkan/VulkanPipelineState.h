@@ -35,6 +35,23 @@ public:
     [[nodiscard]] static u64 Hash(const ComputePipelineDesc& desc);
 
 private:
+    struct CacheKey
+    {
+        u64 hash = 0;
+        u64 shaderA = 0;
+        u64 shaderB = 0;
+        bool operator==(const CacheKey& other) const = default;
+    };
+    struct CacheKeyHash
+    {
+        size_t operator()(const CacheKey& key) const noexcept
+        {
+            size_t combined = std::hash<u64>{}(key.hash);
+            combined ^= std::hash<u64>{}(key.shaderA) + 0x9e3779b97f4a7c15ULL + (combined << 6) + (combined >> 2);
+            combined ^= std::hash<u64>{}(key.shaderB) + 0x9e3779b97f4a7c15ULL + (combined << 6) + (combined >> 2);
+            return combined;
+        }
+    };
     struct Entry
     {
         PipelineHandle handle = nullptr;
@@ -42,11 +59,11 @@ private:
         bool pending = false;
     };
 
-    PipelineHandle AcquireHashed(u64 hash, bool compute, const CreateFn& create);
+    PipelineHandle AcquireHashed(const CacheKey& key, bool compute, const CreateFn& create);
 
     std::mutex m_Mutex;
     std::condition_variable m_Cond;
-    std::unordered_map<u64, Entry> m_Graphics;
-    std::unordered_map<u64, Entry> m_Compute;
+    std::unordered_map<CacheKey, Entry, CacheKeyHash> m_Graphics;
+    std::unordered_map<CacheKey, Entry, CacheKeyHash> m_Compute;
 };
 } // namespace UHE::RHI::VULKAN

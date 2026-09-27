@@ -232,9 +232,15 @@ private:
         u32 width = 1;
         u32 height = 1;
         TextureFormat format = TextureFormat::RGBA8_UNORM;
+        u32 generation = 0;
+    };
+    struct RGRegisteredBuffer
+    {
+        vk::Buffer buffer = nullptr;
+        u32 generation = 0;
     };
     std::unordered_map<u32, RGRegisteredTexture> m_Textures; // registry slot → live object
-    std::unordered_map<u32, vk::Buffer> m_Buffers;
+    std::unordered_map<u32, RGRegisteredBuffer> m_Buffers;
     std::vector<std::string> m_RegistrationWarnings;
 
     // TaskGraph node contexts (stable addresses across node creation; §8.5).

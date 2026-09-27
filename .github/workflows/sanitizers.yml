@@ -8,6 +8,9 @@ on:
   # Allow manual trigger from GitHub Actions tab
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   sandbox-smoke:
     name: Sandbox smoke (${{ matrix.sanitizer }})

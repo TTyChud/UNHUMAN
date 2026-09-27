@@ -63,8 +63,12 @@ public:
     // work; the executor (step 3) consumes it. Never throws; errors collected.
     [[nodiscard]] RGCompileResult Compile() const
     {
-        RGCompileResult result =
+        RGCompileResult result;
+        result.errors = m_Builder.Validate();
+        RGCompileResult compilerResult =
             VulkanRenderGraphCompiler::Compile(m_Builder.Passes(), m_Builder.Resources());
+        result.errors.insert(result.errors.end(), compilerResult.errors.begin(), compilerResult.errors.end());
+        result.frame = std::move(compilerResult.frame);
         // The compiler hashes the resource slice; the cache key is the full
         // resources + pass-structure hash from the builder.
         result.frame.topologyHash = m_Builder.ComputeTopologyHash();

@@ -1,4 +1,5 @@
 #include "VulkanPipelineState.h"
+#include "VulkanShader.h"
 #include <cstdint>
 #include <type_traits>
 
@@ -37,8 +38,10 @@ u64 VulkanPipelineStateCache::Hash(const GraphicsPipelineDesc& desc)
 {
     u64 seed = 0x243F6A8885A308D3ULL;
 
-    HashAdd(seed, static_cast<const void*>(desc.vertexShader));
-    HashAdd(seed, static_cast<const void*>(desc.fragmentShader));
+    const auto* vertexShader = reinterpret_cast<const VulkanShader*>(desc.vertexShader);
+    const auto* fragmentShader = reinterpret_cast<const VulkanShader*>(desc.fragmentShader);
+    HashAdd(seed, vertexShader ? vertexShader->GetStableId() : 0);
+    HashAdd(seed, fragmentShader ? fragmentShader->GetStableId() : 0);
 
     const auto& elements = desc.vertexLayout.GetElements();
     HashAdd(seed, static_cast<u64>(elements.size()));
@@ -98,7 +101,8 @@ u64 VulkanPipelineStateCache::Hash(const ComputePipelineDesc& desc)
 {
     u64 seed = 0x9E3779B97F4A7C15ULL;
 
-    HashAdd(seed, static_cast<const void*>(desc.computeShader));
+    const auto* computeShader = reinterpret_cast<const VulkanShader*>(desc.computeShader);
+    HashAdd(seed, computeShader ? computeShader->GetStableId() : 0);
     HashAdd(seed, desc.pushConstantSize);
 
     return seed;
@@ -106,25 +110,31 @@ u64 VulkanPipelineStateCache::Hash(const ComputePipelineDesc& desc)
 
 PipelineHandle VulkanPipelineStateCache::Acquire(const GraphicsPipelineDesc& desc, const CreateFn& create)
 {
-    return AcquireHashed(Hash(desc), false, create);
+    const auto* vertexShader = reinterpret_cast<const VulkanShader*>(desc.vertexShader);
+    const auto* fragmentShader = reinterpret_cast<const VulkanShader*>(desc.fragmentShader);
+    const CacheKey key{Hash(desc), vertexShader ? vertexShader->GetStableId() : 0,
+                       fragmentShader ? fragmentShader->GetStableId() : 0};
+    return AcquireHashed(key, false, create);
 }
 
 PipelineHandle VulkanPipelineStateCache::Acquire(const ComputePipelineDesc& desc, const CreateFn& create)
 {
-    return AcquireHashed(Hash(desc), true, create);
+    const auto* computeShader = reinterpret_cast<const VulkanShader*>(desc.computeShader);
+    const CacheKey key{Hash(desc), computeShader ? computeShader->GetStableId() : 0, 0};
+    return AcquireHashed(key, true, create);
 }
 
-PipelineHandle VulkanPipelineStateCache::AcquireHashed(u64 hash, bool compute, const CreateFn& create)
+PipelineHandle VulkanPipelineStateCache::AcquireHashed(const CacheKey& key, bool compute, const CreateFn& create)
 {
     auto* map = compute ? &m_Compute : &m_Graphics;
     std::unique_lock<std::mutex> lock(m_Mutex);
 
     for (;;)
     {
-        auto it = map->find(hash);
+        auto it = map->find(key);
         if (it == map->end())
         {
-            (*map)[hash].pending = true;
+            (*map)[key].pending = true;
 
             lock.unlock();
             PipelineHandle handle = nullptr;
@@ -135,15 +145,15 @@ PipelineHandle VulkanPipelineStateCache::AcquireHashed(u64 hash, bool compute, c
             catch (...)
             {
                 lock.lock();
-                map->erase(hash);
+                map->erase(key);
                 m_Cond.notify_all();
                 throw;
             }
             lock.lock();
 
-            auto ready = map->find(hash);
+            auto ready = map->find(key);
             if (ready == map->end())
-                ready = map->emplace(hash, Entry{}).first;
+                ready = map->emplace(key, Entry{}).first;
             ready->second.handle = handle;
             ready->second.refCount = 1;
             ready->second.pending = false;
@@ -153,8 +163,8 @@ PipelineHandle VulkanPipelineStateCache::AcquireHashed(u64 hash, bool compute, c
 
         if (it->second.pending)
         {
-            m_Cond.wait(lock, [map, hash]() {
-                auto pending = map->find(hash);
+            m_Cond.wait(lock, [map, key]() {
+                auto pending = map->find(key);
                 return pending == map->end() || !pending->second.pending;
             });
             continue;
@@ -172,7 +182,7 @@ bool VulkanPipelineStateCache::Release(PipelineHandle handle)
 
     std::unique_lock<std::mutex> lock(m_Mutex);
 
-    const auto release = [&handle](std::unordered_map<u64, Entry>& map) {
+    const auto release = [&handle](auto& map) {
         for (auto it = map.begin(); it != map.end(); ++it)
         {
             if (it->second.handle != handle)

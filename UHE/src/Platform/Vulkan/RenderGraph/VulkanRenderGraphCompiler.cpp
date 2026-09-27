@@ -123,9 +123,10 @@ RGPassRequirements CollectRequirements(const RGPassSpec& spec,
         {
             const RGUseRequirement req = TextureReadRequirement(spec.type);
             const auto [it, inserted] = reqs.textures.emplace(access.texture.index, req);
-            if (!inserted && it->second.state != req.state && !errors.empty())
+            if (!inserted && it->second.state != req.state)
             {
-                // Already reported via the write side; keep one error.
+                errors.push_back({RGErrorType::PassStateConflict, spec.name, "", ""});
+                errors.back().message = "Texture required in two different states by one pass";
             }
             reqs.textureHandles.emplace(access.texture.index, access.texture);
         }
@@ -446,6 +447,8 @@ RGCompileResult VulkanRenderGraphCompiler::Compile(const std::vector<RGPassSpec>
     // texture (or the last pass overall when the consumer was culled).
     for (auto& [slot, track] : texTracks)
     {
+        if (!track.used)
+            continue;
         const RGTextureSlot& textureSlot = resources.Textures()[slot];
         const ImageState finalState = textureSlot.desc.finalState;
         if (finalState == ImageState::Undefined || finalState == track.state)

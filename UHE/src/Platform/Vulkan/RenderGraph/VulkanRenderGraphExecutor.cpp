@@ -49,7 +49,7 @@ void VulkanRenderGraphExecutor::RegisterTexture(RGTextureHandle texture, vk::Ima
         m_RegistrationWarnings.push_back("RegisterTexture: null image or view");
         return;
     }
-    m_Textures[texture.index] = RGRegisteredTexture{image, view, width, height, format};
+    m_Textures[texture.index] = RGRegisteredTexture{image, view, width, height, format, texture.generation};
 }
 
 void VulkanRenderGraphExecutor::RegisterBuffer(RGBufferHandle buffer, vk::Buffer vkBuffer)
@@ -59,7 +59,7 @@ void VulkanRenderGraphExecutor::RegisterBuffer(RGBufferHandle buffer, vk::Buffer
         m_RegistrationWarnings.push_back("RegisterBuffer: invalid handle or null buffer");
         return;
     }
-    m_Buffers[buffer.index] = vkBuffer;
+    m_Buffers[buffer.index] = RGRegisteredBuffer{vkBuffer, buffer.generation};
 }
 
 void VulkanRenderGraphExecutor::ClearRegistrations()
@@ -98,7 +98,7 @@ RGResolvedFrame VulkanRenderGraphExecutor::Resolve(const RGCompiledFrame& compil
             for (const RGColorAttachment& color : spec.colors)
             {
                 const auto it = m_Textures.find(color.texture.index);
-                if (it == m_Textures.end())
+                if (it == m_Textures.end() || it->second.generation != color.texture.generation)
                 {
                     fail(pass.name + ": color attachment \"" + "texture#" +
                          std::to_string(color.texture.index) + "\" is not registered");
@@ -130,7 +130,7 @@ RGResolvedFrame VulkanRenderGraphExecutor::Resolve(const RGCompiledFrame& compil
             if (spec.hasDepth && spec.depth.texture.IsValid())
             {
                 const auto it = m_Textures.find(spec.depth.texture.index);
-                if (it == m_Textures.end())
+                if (it == m_Textures.end() || it->second.generation != spec.depth.texture.generation)
                 {
                     fail(pass.name + ": depth attachment is not registered");
                 }
@@ -154,7 +154,7 @@ RGResolvedFrame VulkanRenderGraphExecutor::Resolve(const RGCompiledFrame& compil
         for (const RGCompiledImageBarrier& barrier : compiledPass.preImageBarriers)
         {
             const auto it = m_Textures.find(barrier.texture.index);
-            if (it == m_Textures.end())
+            if (it == m_Textures.end() || it->second.generation != barrier.texture.generation)
             {
                 fail(pass.name + ": pre-barrier texture#" + std::to_string(barrier.texture.index) +
                      " is not registered");
@@ -178,7 +178,7 @@ RGResolvedFrame VulkanRenderGraphExecutor::Resolve(const RGCompiledFrame& compil
         for (const RGCompiledImageBarrier& barrier : compiledPass.postImageBarriers)
         {
             const auto it = m_Textures.find(barrier.texture.index);
-            if (it == m_Textures.end())
+            if (it == m_Textures.end() || it->second.generation != barrier.texture.generation)
             {
                 fail(pass.name + ": post-barrier texture#" + std::to_string(barrier.texture.index) +
                      " is not registered");
@@ -202,14 +202,14 @@ RGResolvedFrame VulkanRenderGraphExecutor::Resolve(const RGCompiledFrame& compil
         for (const RGCompiledBufferBarrier& barrier : compiledPass.preBufferBarriers)
         {
             const auto it = m_Buffers.find(barrier.buffer.index);
-            if (it == m_Buffers.end())
+            if (it == m_Buffers.end() || it->second.generation != barrier.buffer.generation)
             {
                 fail(pass.name + ": buffer barrier buffer#" + std::to_string(barrier.buffer.index) +
                      " is not registered");
                 continue;
             }
             BufferBarrier resolvedBarrier;
-            resolvedBarrier.Buffer = it->second;
+            resolvedBarrier.Buffer = it->second.buffer;
             resolvedBarrier.SrcStage = barrier.srcStage;
             resolvedBarrier.DstStage = barrier.dstStage;
             resolvedBarrier.SrcAccess = barrier.srcAccess;
@@ -397,20 +397,33 @@ void VulkanRenderGraphExecutor::ExecuteGraph(Jobsystem::TaskGraph& graph, Jobsys
 vk::ImageView VulkanRenderGraphExecutor::ResolveView(RGTextureHandle texture) const
 {
     const auto it = m_Textures.find(texture.index);
-    return it != m_Textures.end() ? it->second.view : vk::ImageView{nullptr};
+    return it != m_Textures.end() && it->second.generation == texture.generation ? it->second.view
+                                                                                 : vk::ImageView{nullptr};
 }
 
 vk::Buffer VulkanRenderGraphExecutor::ResolveBuffer(RGBufferHandle buffer) const
 {
     const auto it = m_Buffers.find(buffer.index);
-    return it != m_Buffers.end() ? it->second : vk::Buffer{nullptr};
+    return it != m_Buffers.end() && it->second.generation == buffer.generation ? it->second.buffer
+                                                                               : vk::Buffer{nullptr};
+}
+
+vk::ImageView RGPassContext::View(RGTextureHandle texture) const
+{
+    return m_Executor.ResolveView(texture);
+}
+
+vk::Buffer RGPassContext::Buffer(RGBufferHandle buffer) const
+{
+    return m_Executor.ResolveBuffer(buffer);
 }
 
 vk::Extent2D VulkanRenderGraphExecutor::ResolveExtent(RGTextureHandle texture) const
 {
     const auto it = m_Textures.find(texture.index);
-    return it != m_Textures.end() ? vk::Extent2D{it->second.width, it->second.height}
-                                  : vk::Extent2D{};
+    return it != m_Textures.end() && it->second.generation == texture.generation
+               ? vk::Extent2D{it->second.width, it->second.height}
+               : vk::Extent2D{};
 }
 
 } // namespace UHE::RHI::VULKAN

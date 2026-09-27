@@ -163,10 +163,10 @@ endif()
 # but this guard additionally catches stale objects of targets/sources that no
 # longer exist (renames, disabled targets) - cheap insurance.
 if(NOT DEFINED UHE_SANITIZER_LAST)
-    set(UHE_SANITIZER_LAST "" CACHE INTERNAL "Sanitizer set of the last configure in this dir")
+    set(UHE_SANITIZER_LAST "__UNINITIALIZED__" CACHE INTERNAL "Sanitizer set of the last configure in this dir")
 endif()
 if(NOT UHE_SANITIZER_LAST STREQUAL "${UHE_SANITIZER_EFFECTIVE}")
-    if(UHE_SANITIZER_LAST)
+    if(NOT UHE_SANITIZER_LAST STREQUAL "__UNINITIALIZED__")
         file(GLOB_RECURSE UHE_STALE_OBJECTS
             "${CMAKE_BINARY_DIR}/CMakeFiles/*.o"
             "${CMAKE_BINARY_DIR}/CMakeFiles/*.d")

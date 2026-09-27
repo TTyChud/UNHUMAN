@@ -1,4 +1,5 @@
 #include "Taskgraph.h"
+#include "UHE/Core/Log.h"
 #include <algorithm>
 
 namespace UHE::Jobsystem
@@ -6,10 +7,6 @@ namespace UHE::Jobsystem
 
 TaskID TaskGraph::CreateTask(JobFn fn, void* pContext)
 {
-    // Reserve() copies/moves existing nodes but never reallocates while tasks
-    // are being created, so the push_back below can never move the array out
-    // from under an id captured elsewhere during graph building.
-    m_nodes.reserve(m_nodes.size() + 1);
     const TaskID id = static_cast<TaskID>(m_nodes.size());
     TaskNode& node = m_nodes.emplace_back();
     node.entryPoint = fn;
@@ -19,6 +16,12 @@ TaskID TaskGraph::CreateTask(JobFn fn, void* pContext)
 
 void TaskGraph::AddDependency(TaskID a, TaskID b)
 {
+    if (a == b || a >= static_cast<TaskID>(m_nodes.size()) || b >= static_cast<TaskID>(m_nodes.size()))
+    {
+        UHE_CORE_ERROR("TaskGraph::AddDependency: invalid dependency (a={}, b={}, taskCount={})", a, b,
+                       m_nodes.size());
+        return;
+    }
     // Task A must finish before Task B can start.
     // We add B to A's dependents list.
     m_nodes[a].dependents.push_back(b);

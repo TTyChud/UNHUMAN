@@ -74,6 +74,7 @@ void UheJobsystem::ParallelFor(u32 jobCount, const std::function<void(u32)>& fn,
 {
     if (jobCount == 0 || !fn)
         return;
+    minBatchSize = std::max(1u, minBatchSize);
 
     // Single iteration (or single core): just run it inline, no scheduling overhead.
     const u32 workerCount = std::max(1u, static_cast<u32>(m_Workers.size()));
