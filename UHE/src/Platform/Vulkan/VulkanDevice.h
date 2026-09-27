@@ -140,7 +140,8 @@ private:
     u32 m_CurrentFrame = 0;
     u32 m_ImageIndex = 0; // Current swapchain image index
     bool m_FramebufferResized = false;
-    bool m_FrameSkipped = false; // §9.1.4: acquire failed → recreate + skip
+    bool m_FrameSkipped = false;      // §9.1.4: acquire failed → recreate + skip
+    bool m_FrameGraphFailed = false;  // graph compile/resolve failed → skip submit/present
 
     // Render graph execution (§8.5/§8.6): resolves RG handles to the live
     // swapchain images each frame and encodes compiler-derived barriers.

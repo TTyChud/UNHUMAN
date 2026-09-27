@@ -80,6 +80,16 @@ void VulkanDevice::InitVulkan(const SwapchainDesc& swapDesc)
     
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*m_LogicalDevice.getLogicalDevice());
 
+    // The frame graph drives the frame loop (scene + ImGui passes) and
+    // VulkanRenderGraphExecutor::RecordRange always uses vkCmdBeginRendering —
+    // there is no render-pass/framebuffer fallback. Reject devices that cannot
+    // support it up front instead of silently dropping every graph pass.
+    if (!m_ExtensionCheck.SupportsDynamicRendering())
+    {
+        throw std::runtime_error(
+            "VulkanDevice requires VK_KHR_dynamic_rendering (Vulkan 1.3): the render graph has no fallback");
+    }
+
     m_Allocator = m_LogicalDevice.getAllocator();
 
     m_SwapChain.createSwapChain(m_LogicalDevice.getLogicalDevice(), m_PhysicalDevice.getPhysicalDevice(),
@@ -355,6 +365,7 @@ void VulkanDevice::DeferDestruction(std::function<void()>&& function)
 void VulkanDevice::Begin()
 {
     m_FrameSkipped = false;
+    m_FrameGraphFailed = false;
     m_RenderGraphExecutor.ClearRegistrations();
 
     // ── Pacing (§9.1.1): wait for this frame slot's previous use. The timeline
@@ -401,9 +412,6 @@ void VulkanDevice::Begin()
         throw std::runtime_error("Failed to acquire swap chain image!");
     }
 
-    if (!m_FrameSkipped)
-        m_LogicalDevice.getLogicalDevice().resetFences({*m_Frames[m_CurrentFrame].GetInFlightFence()});
-
     m_ImageIndex = imageIndex;
     m_Context.currentFrameIndex = m_CurrentFrame;
     m_Context.imageIndex = m_ImageIndex;
@@ -430,12 +438,30 @@ void VulkanDevice::End()
     if (m_FrameSkipped)
     {
         // §9.1.4: nothing was acquired — no submit, no present. The (empty or
-        // partial) command buffer is discarded; the frame slot advances.
+        // partial) command buffer is discarded; the frame slot advances. The
+        // in-flight fence is left signaled (it is reset only immediately before
+        // a real submit below), so the next Begin() on this slot cannot hang.
         m_FrameGraph.Reset();
         m_FrameSkipped = false;
         m_CurrentFrame = (m_CurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         return;
     }
+
+    if (m_FrameGraphFailed)
+    {
+        // EndFrameGraph already reset the graph and logged the cause. The
+        // acquired image was never transitioned to Present (the graph emits
+        // that), so submitting/presenting it would be invalid: skip both. The
+        // fence stays signaled for the same reason as the skipped path.
+        m_FrameGraphFailed = false;
+        m_CurrentFrame = (m_CurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+        return;
+    }
+
+    // Fence reset is deferred to here rather than done in Begin(): a skipped or
+    // graph-failed frame never submits, so leaving the (already-signaled) fence
+    // alone keeps the next Begin()'s wait a no-op.
+    m_LogicalDevice.getLogicalDevice().resetFences({*m_Frames[m_CurrentFrame].GetInFlightFence()});
 
     // ── Acquire/present edges (§9.1.3): wait imageAvailable[frame] at
     // ColorAttachmentOutput; signal renderFinished[image] (binary, per swapchain
@@ -547,6 +573,7 @@ void VulkanDevice::EndFrameGraph()
     if (!m_ExtensionCheck.SupportsDynamicRendering())
     {
         UHE_CORE_ERROR("EndFrameGraph: dynamic rendering is not supported on this device; skipping frame graph");
+        m_FrameGraphFailed = true;
         m_FrameGraph.Reset();
         return;
     }
@@ -562,6 +589,7 @@ void VulkanDevice::EndFrameGraph()
     {
         for (const RGValidationError& error : compiled.errors)
             UHE_CORE_ERROR("FrameGraph: {} ({})", error.message, error.passName);
+        m_FrameGraphFailed = true;
         m_FrameGraph.Reset();
         return;
     }
@@ -578,6 +606,7 @@ void VulkanDevice::EndFrameGraph()
     {
         for (const std::string& error : resolveErrors)
             UHE_CORE_ERROR("FrameGraph resolve: {}", error);
+        m_FrameGraphFailed = true;
         m_FrameGraph.Reset();
         return;
     }

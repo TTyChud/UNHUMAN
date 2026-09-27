@@ -10,7 +10,11 @@ void VulkanSemaphore::Init(bool requestTimeline, u64 initialValue, VulkanContext
 {
     ctx = context;
 
-    m_IsTimeline = requestTimeline && ctx->CheckExtensions->Supports(Extension::TimelineSemaphore);
+    // Timeline semaphores are only valid on the Sync2 submit path: the Legacy
+    // vkQueueSubmit path cannot carry semaphore values. Degrade to binary
+    // unless the device is on the Sync2Timeline tier — this also covers devices
+    // that expose timeline semaphores without VK_KHR_synchronization2.
+    m_IsTimeline = requestTimeline && ctx->CheckExtensions->GetSyncTier() == SyncTier::Sync2Timeline;
 
     vk::SemaphoreTypeCreateInfo timelineInfo;
     timelineInfo.semaphoreType = m_IsTimeline ? vk::SemaphoreType::eTimeline : vk::SemaphoreType::eBinary;
